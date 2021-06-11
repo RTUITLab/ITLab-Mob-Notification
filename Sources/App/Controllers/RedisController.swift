@@ -13,58 +13,90 @@ import Redis
 
 class RedisController {
     
-    let websocket: WebSocketController
-    let config: ConfigurationService
+    private let errorChannel: RedisChannelName = "errorInfo"
+    private let pushChannel: RedisChannelName = "pushInfo"
     
-    init(_ app: Application, websocket: WebSocketController, config: ConfigurationService) throws {
+    let websocket: WebSocketController
+    let config: ConfigurationService?
+    
+    var publishRedis: RedisConnection?
+    
+    init(_ app: Application, websocket: WebSocketController, config: ConfigurationService?) throws {
         
         self.websocket = websocket
         self.config = config
+        self.publishRedis = try redisConnected(app)
         
-        try redisConnected(app) { redis in
-            redis.subscribe(to: "pushInfo") { channel, message in
-                switch channel {
-                case "pushInfo" :
-                    app.logger.info("redis: Message is received")
-                    if let mess = message.string?.data(using: .utf8) {
-                        do {
-                            let result = try JSONDecoder().decode(RedisPushModel.self, from: mess)
-                            
-                            try self.pushToUsers(app, model: result).whenSuccess {}
-                            
-                        } catch {
-                            app.logger.error("redis: Incorrect message")
-                        }
+        let redis = try redisConnected(app)
+        
+        redis.subscribe(to: pushChannel) { channel, message in
+            switch channel {
+            case "pushInfo" :
+                app.logger.info("redis: Message is received")
+                if let mess = message.string?.data(using: .utf8) {
+                    do {
+                        let result = try JSONDecoder().decode(RedisPushModel.self, from: mess)
+                        
+                        try self.pushToUsers(app, model: result).whenSuccess {}
+                        
+                    } catch {
+                        app.logger.error("redis: Incorrect message")
+                        
+                        self.errorRedis(message: .incorrectMessage)
                     }
-                default: break
                 }
-            }.whenComplete { result in
-                switch result {
-                case .success():
-                    app.logger.info("Redis subscribe")
-                case .failure(let error):
-                    app.logger.error("redis: \(error.localizedDescription)")
-                }
+            default: break
+            }
+        }.whenComplete { result in
+            switch result {
+            case .success():
+                app.logger.info("Redis subscribe")
+            case .failure(let error):
+                app.logger.error("redis: \(error.localizedDescription)")
             }
         }
-        
     }
     
-    func redisConnected(_ app: Application, connected: @escaping (RedisConnection) -> Void) throws {
+    func redisConnected(_ app: Application) throws -> RedisConnection {
         let eventLoop = app.eventLoopGroup.next()
-        try RedisConnection.make(configuration: config.redisConfig(app),
-                                 boundEventLoop: eventLoop)
-            .flatMapErrorThrowing { error in
-                app.logger.error("Not redis connection: \(error.localizedDescription)")
-                throw ServerError.noRedisConnection
-            }.map({ redis in
-                connected(redis)
-            }).wait()
+        
+        if let config = config {
+            return try RedisConnection.make(configuration: config.redisConfig(app),
+                                            boundEventLoop: eventLoop)
+                .flatMapErrorThrowing { error in
+                    app.logger.error("Not redis connection: \(error.localizedDescription)")
+                    throw ServerError.noRedisConnection
+                }.wait()
+            
+        } else if app.environment == .testing,
+                  let url = Environment.get("REDIS_URL") {
+            return try RedisConnection.make(configuration: .init(url: url),
+                                            boundEventLoop: eventLoop)
+                .flatMapErrorThrowing { error in
+                    app.logger.error("Not redis connection: \(error.localizedDescription)")
+                    throw ServerError.noRedisConnection
+                }.wait()
+        }
+        
+        throw ServerError.missingConfiguration
+    }
+    
+    func errorRedis(message: RedisError) {
+        if let redis = self.publishRedis,
+           let error = message.getJson() {
+            redis.publish(error, to: self.errorChannel)
+        }
     }
     
     func pushToUsers(_ app: Application, model: RedisPushModel) throws -> EventLoopFuture<Void> {
         
-        DeviceInfo.query(on: app.db).group(.or) { group in
+        if app.environment == .testing {
+            return app.eventLoopGroup.future().map {
+                self.assemblyWebSocket(usersId: model.users, message: model.message)
+            }
+        }
+        
+        return DeviceInfo.query(on: app.db).group(.or) { group in
             model.users.forEach {group.filter(\.$user.$id == $0)}
         }.all().flatMap { devices -> EventLoopFuture<Void> in
             self.assemblyDevice(app, devices: devices, message: model.message).flatten(on: app.eventLoopGroup.next())
@@ -137,12 +169,19 @@ class RedisController {
     }
     
     func assemblyWebSocket(usersId: [UUID], message: RedisPushMessageModel) {
-        websocket.sockets.filter {usersId.contains($0.user)}
+        websocket.sockets.filter {usersId.contains($0.userId)}
             .forEach { wSocket in
                 if let jsonData = try? JSONEncoder().encode(message) {
                     let jsonString = String(data: jsonData, encoding: .utf8)!
                     wSocket.socket.send(jsonString)
                 }
             }
+        
+        let socketsUsers = websocket.sockets.map {$0.userId}
+        let notUsers = usersId.filter { !socketsUsers.contains($0) }
+        
+        if !notUsers.isEmpty {
+            self.errorRedis(message: .noUsersFound(id: notUsers))
+        }
     }
 }

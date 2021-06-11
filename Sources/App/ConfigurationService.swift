@@ -18,51 +18,50 @@ import FoundationNetworking
 #endif
 
 struct ConfigurationService: Content {
-
+    
     let apns: APNsKey
-
+    
     let jwkURL: String?
-
+    
     let database: DatabasesSetting
-
+    
     let redis: RedisSetting
-
+    
     public static func loadSettings() -> ConfigurationService? {
         let decoder = JSONDecoder()
-
+        
         let directory = DirectoryConfiguration.detect()
-
+        
         let file = "settings.json"
         var fileURL = URL(fileURLWithPath: directory.workingDirectory)
         
         var path: String = "Private/json/"
-
+        
         if let secretPath = Environment.get("PATH_SECRETS") {
             path = secretPath
             fileURL = fileURL.deletingLastPathComponent()
         }
-
+        
         fileURL = fileURL.appendingPathComponent(path, isDirectory: true)
             .appendingPathComponent(file, isDirectory: false)
-
+        
         guard
             let data = try? Data(contentsOf: fileURL),
             let persone = try? decoder.decode(ConfigurationService.self, from: data)
         else {
             return nil
         }
-
+        
         return persone
     }
 }
 
 extension ConfigurationService {
     struct APNsKey: Content {
-        let keyIdentifier: String
-        let teamIdentifier: String
+        let keyPass: String
         let topic: String
     }
-
+    
     struct DatabasesSetting: Content {
         let hostname: String
         let login: String
@@ -78,20 +77,20 @@ extension ConfigurationService {
     
     func fcm(_ app: Application) throws {
         let directory = DirectoryConfiguration.detect()
-
+        
         let file = "FCM.json"
         var fileURL = URL(fileURLWithPath: directory.workingDirectory)
         
         var path: String = "Private/json/"
-
+        
         if let secretPath = Environment.get("PATH_SECRETS") {
             path = secretPath
             fileURL = fileURL.deletingLastPathComponent()
         }
-
+        
         fileURL = fileURL.appendingPathComponent(path, isDirectory: true)
             .appendingPathComponent(file, isDirectory: false)
-
+        
         guard
             let data = try? Data(contentsOf: fileURL)
         else {
@@ -103,33 +102,30 @@ extension ConfigurationService {
     }
     
     func apns(_ app: Application) throws {
-        switch app.environment {
-        case .production:
-            app.apns.configuration = try .init(
-                authenticationMethod: .jwt(
-                    key: .private(),
-                    keyIdentifier: JWKIdentifier(string: apns.keyIdentifier),
-                    teamIdentifier: apns.teamIdentifier
-                ),
-                topic: apns.topic,
-                environment: .production
-            )
-            
-            app.apns.configuration?.timeout = .minutes(1)
-            
-        default:
-            app.apns.configuration = try .init(
-                authenticationMethod: .jwt(
-                    key: .private(),
-                    keyIdentifier: JWKIdentifier(string: apns.keyIdentifier),
-                    teamIdentifier: apns.teamIdentifier
-                ),
-                topic: apns.topic,
-                environment: .sandbox
-            )
-            
-            app.apns.configuration?.timeout = .seconds(10)
+        
+        var path: String = "Private/APNs"
+        
+        let directory = DirectoryConfiguration.detect()
+        var fileURL = URL(fileURLWithPath: directory.workingDirectory)
+        
+        if let secretPath = Environment.get("PATH_SECRETS") {
+            path = secretPath
+            fileURL = fileURL.deletingLastPathComponent()
         }
+        
+        let key = fileURL.appendingPathComponent(path, isDirectory: true)
+            .appendingPathComponent("apns.key.pem", isDirectory: false)
+        
+        let cer = fileURL.appendingPathComponent(path, isDirectory: true)
+            .appendingPathComponent("apns.crt.pem", isDirectory: false)
+        
+        let tls: APNSwiftConfiguration.AuthenticationMethod = try .tls(privateKeyPath: key.path,
+                                                                        pemPath: cer.path,
+                                                                        pemPassword: Array(apns.keyPass.utf8))
+        let env: APNSwiftConfiguration.Environment = app.environment == .production ? .production : .sandbox
+        
+        app.apns.configuration = .init(authenticationMethod: tls, topic: apns.topic, environment: env)
+        app.apns.configuration?.timeout = app.environment == .production ? .minutes(1) : .seconds(10)
     }
     
     func redisConfig(_ app: Application) throws -> RedisConnection.Configuration {
@@ -178,8 +174,8 @@ extension ConfigurationService {
         CreateTopicNotification().revert(on: app.db)
             .and(CreateUserTopic().revert(on: app.db))
             .whenSuccess { _ in
-            app.logger.info("Revert token")
-        }
+                app.logger.info("Revert token")
+            }
         
         app.autoMigrate().whenComplete { result in
             switch result {
@@ -190,30 +186,5 @@ extension ConfigurationService {
             }
             
         }
-    }
-}
-
-extension ECDSAKey {
-    
-    public static func `private`() throws -> JWTKit.ECDSAKey {
-        let directory = DirectoryConfiguration.detect()
-        
-        var path: String = "Private/"
-        
-        let file = "APNs.p8"
-        var fileURL = URL(fileURLWithPath: directory.workingDirectory)
-        
-        if let secretPath = Environment.get("PATH_SECRETS") {
-            path = secretPath
-            fileURL = fileURL.deletingLastPathComponent()
-        }
-        
-        fileURL = fileURL.appendingPathComponent(path, isDirectory: true)
-            .appendingPathComponent(file, isDirectory: false)
-        
-        guard let data = try? Data(contentsOf: fileURL) else {
-            throw APNSwiftError.SigningError.certificateFileDoesNotExist
-        }
-        return try .private(pem: data)
     }
 }
